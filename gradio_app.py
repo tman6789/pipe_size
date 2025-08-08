@@ -137,7 +137,7 @@ def compute_results(total_mw: float,
     return summary_md, main_df, riser_df, chiller_df_pretty
 
 
-def build_interface(share: bool = False):
+def build_interface(port: int, share: bool = False):
     fluid_names = [get_fluid_name(f) for f in get_fluid_options()]
 
     with gr.Blocks(title="Data Center Pipe Sizer") as demo:
@@ -200,7 +200,7 @@ def build_interface(share: bool = False):
             outputs=[summary, main_table, riser_table, chiller_table],
         )
 
-    demo.launch(share=share)
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
 
 
 if __name__ == "__main__":
@@ -210,7 +210,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     port = int(os.getenv("PORT", "7860"))
-    # IMPORTANT: bind to all interfaces and use the platform port
-    build_interface(share=args.share)  # keep the builder
-    # and update inside build_interface to:
-    # demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    build_interface(port=port, share=args.share)
