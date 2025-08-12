@@ -205,9 +205,184 @@ def validate_hall_data(hall_data: pd.DataFrame) -> Tuple[bool, str]:
     return True, ""
 
 
+def calculate_riser_count(columns: int, rows: int, shared_risers: bool = True) -> int:
+    """
+    Calculate number of risers based on layout and sharing strategy.
+    
+    Args:
+        columns: Number of columns in layout
+        rows: Number of rows in layout  
+        shared_risers: If True, use shared model (2*(C+R)), else unshared (4*(C+R))
+    
+    Returns:
+        Number of risers required
+    """
+    if shared_risers:
+        return 2 * (columns + rows)
+    else:
+        return 4 * (columns + rows)
+
+
+def build_hall_table(columns: int, rows: int, floors: int, 
+                    it_mw_data: Dict[str, float], 
+                    fan_percent: float = 5.0,
+                    misc_load_mw: float = 0.0,
+                    misc_per_hall: bool = True,
+                    include_floors: bool = True) -> pd.DataFrame:
+    """
+    Build comprehensive hall table with all load calculations.
+    
+    Args:
+        columns: Number of columns
+        rows: Number of rows
+        floors: Number of floors
+        it_mw_data: Dictionary of hall name -> IT MW
+        fan_percent: Fan heat percentage (default 5%)
+        misc_load_mw: Miscellaneous load in MW
+        misc_per_hall: If True, misc load applied per hall, else total building
+        include_floors: Whether hall names include floor numbers
+        
+    Returns:
+        DataFrame with columns: Hall, Column, Row, Floor, IT_MW, Fan_MW, Misc_MW, Total_Cooling_MW
+    """
+    hall_names = make_hall_names(columns, rows, floors, include_floors)
+    
+    hall_data = []
+    total_halls = len(hall_names)
+    misc_per_hall_mw = misc_load_mw / total_halls if misc_per_hall else 0
+    building_misc_per_hall = misc_load_mw / total_halls if not misc_per_hall else 0
+    
+    for hall_name in hall_names:
+        # Extract position info from hall name
+        if include_floors and '-F' in hall_name:
+            base_name, floor_str = hall_name.split('-F')
+            floor_num = int(floor_str)
+        else:
+            base_name = hall_name
+            floor_num = 1
+        
+        # Extract column and row from base name (e.g., "A1" -> column="A", row=1)
+        column_str = ''
+        row_str = ''
+        for char in base_name:
+            if char.isalpha():
+                column_str += char
+            else:
+                row_str += char
+        
+        row_num = int(row_str) if row_str else 1
+        
+        # Get IT load
+        it_mw = it_mw_data.get(hall_name, 0.0)
+        
+        # Calculate fan load (percentage of IT load)
+        fan_mw = it_mw * (fan_percent / 100)
+        
+        # Calculate misc load
+        if misc_per_hall:
+            misc_mw = misc_per_hall_mw
+        else:
+            misc_mw = building_misc_per_hall
+            
+        # Total cooling load
+        total_cooling_mw = it_mw + fan_mw + misc_mw
+        
+        hall_data.append({
+            'Hall': hall_name,
+            'Column': column_str,
+            'Row': row_num,
+            'Floor': floor_num,
+            'IT_MW': it_mw,
+            'Fan_MW': fan_mw,
+            'Misc_MW': misc_mw,
+            'Total_Cooling_MW': total_cooling_mw
+        })
+    
+    return pd.DataFrame(hall_data)
+
+
+def calculate_riser_reduction_schedule(hall_table: pd.DataFrame, 
+                                     columns: int, rows: int, floors: int) -> pd.DataFrame:
+    """
+    Calculate riser load reduction schedule showing load at each floor level.
+    
+    Args:
+        hall_table: Hall table with cooling loads
+        columns: Number of columns
+        rows: Number of rows  
+        floors: Number of floors
+        
+    Returns:
+        DataFrame with columns: Column, Floor, Floor_Load_MW, Cumulative_Load_MW, Remaining_Load_MW
+    """
+    reduction_data = []
+    
+    # Group halls by column
+    for column in hall_table['Column'].unique():
+        column_halls = hall_table[hall_table['Column'] == column].copy()
+        
+        # Calculate total column load
+        total_column_load = column_halls['Total_Cooling_MW'].sum()
+        
+        # Sort by floor (top floor first for reduction calculation)
+        column_halls = column_halls.sort_values('Floor', ascending=False)
+        
+        cumulative_served = 0
+        
+        # Calculate load at each floor level (from top down)
+        for floor in sorted(column_halls['Floor'].unique(), reverse=True):
+            floor_halls = column_halls[column_halls['Floor'] == floor]
+            floor_load = floor_halls['Total_Cooling_MW'].sum()
+            
+            # Remaining load = total load from this floor and below
+            remaining_load = total_column_load - cumulative_served
+            cumulative_served += floor_load
+            
+            reduction_data.append({
+                'Column': column,
+                'Floor': floor,
+                'Floor_Load_MW': floor_load,
+                'Cumulative_Load_MW': cumulative_served,
+                'Remaining_Load_MW': remaining_load
+            })
+    
+    # Sort by column then floor (ascending for display)
+    df = pd.DataFrame(reduction_data)
+    if not df.empty:
+        df = df.sort_values(['Column', 'Floor'], ascending=[True, True])
+    
+    return df
+
+
+def get_column_summary(hall_table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Get summary of loads by column for riser sizing.
+    
+    Args:
+        hall_table: Hall table with cooling loads
+        
+    Returns:
+        DataFrame with columns: Column, Total_IT_MW, Total_Fan_MW, Total_Misc_MW, Total_Cooling_MW, Hall_Count
+    """
+    if hall_table.empty:
+        return pd.DataFrame(columns=['Column', 'Total_IT_MW', 'Total_Fan_MW', 'Total_Misc_MW', 'Total_Cooling_MW', 'Hall_Count'])
+    
+    summary = hall_table.groupby('Column').agg({
+        'IT_MW': 'sum',
+        'Fan_MW': 'sum', 
+        'Misc_MW': 'sum',
+        'Total_Cooling_MW': 'sum',
+        'Hall': 'count'
+    }).reset_index()
+    
+    summary.columns = ['Column', 'Total_IT_MW', 'Total_Fan_MW', 'Total_Misc_MW', 'Total_Cooling_MW', 'Hall_Count']
+    
+    return summary.sort_values('Column')
+
+
 def get_layout_stats(layout_str: str, include_floors: bool = True) -> Dict[str, any]:
     """
-    Get statistics about a layout configuration.
+    Get statistics about a layout configuration including riser counts.
     
     Args:
         layout_str: Layout specification like '4×3×2'
@@ -226,6 +401,8 @@ def get_layout_stats(layout_str: str, include_floors: bool = True) -> Dict[str, 
             'floors': floors,
             'total_halls': len(hall_names),
             'halls_per_floor': columns * rows,
+            'shared_risers': calculate_riser_count(columns, rows, True),
+            'unshared_risers': calculate_riser_count(columns, rows, False),
             'valid': True,
             'error': None
         }
@@ -237,6 +414,8 @@ def get_layout_stats(layout_str: str, include_floors: bool = True) -> Dict[str, 
             'floors': 0,
             'total_halls': 0,
             'halls_per_floor': 0,
+            'shared_risers': 0,
+            'unshared_risers': 0,
             'valid': False,
             'error': str(e)
         }

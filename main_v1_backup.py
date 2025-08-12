@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-Data Center Pipe Sizer V2 Enhanced - CLI Calculator
+Data Center Pipe Sizer V2 - Enhanced CLI Calculator
 
-Enhanced Features:
-- Advanced riser modeling with proper counts
-- Per-floor reduction with downstream load sequencing
-- Comprehensive cooling load math (IT + Fan% + Misc)
-- Enhanced hall load tables
-- Advanced velocity warnings and edge case handling
-- Riser reduction schedule for diameter stepping
-- Integrated chiller sizing with tons conversion
-
-Run locally:
-  python main_enhanced.py
+Features:
+- Layout-based sizing (C×R×F format)
+- Per-hall MW inputs or uniform distribution
+- Riser sharing analysis
+- Enhanced input validation and flow control
+- Integrated visualization and reporting
 """
 
 import math
 import os
 import sys
-import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from calc.pipe_lookup import get_nominal_pipe_size, get_pipe_id
 from calc.fluid_properties import get_fluid_options, get_fluid_properties, get_fluid_name
@@ -39,7 +33,6 @@ try:
 except ImportError:
     VISUALIZATION_AVAILABLE = False
     print("Warning: Plotly not available. Charts will be skipped.")
-
 
 def pipeline_sizing(mass_flow_rate, density, viscosity, max_pressure_drop, max_velocity):
     """
@@ -124,30 +117,27 @@ def pipeline_sizing(mass_flow_rate, density, viscosity, max_pressure_drop, max_v
         "Pressure Drop (psi)": round(actual_dp / 144, 1),
     }
 
-
 def display_welcome():
-    """Display welcome message and enhanced V2 features."""
-    print("="*80)
-    print("🏢 DATA CENTER PIPE SIZER V2 ENHANCED")
-    print("="*80)
-    print("Professional chilled-water piping and chiller sizing tool with advanced features")
-    print("\n🔥 ENHANCED V2 FEATURES:")
-    print("• Advanced riser modeling: shared = 2×(C+R), unshared = 4×(C+R)")
-    print("• Per-floor reduction with downstream load sequencing")
-    print("• Comprehensive cooling load math (IT + Fan% + Misc per-hall/building)")
-    print("• Enhanced hall load tables with position tracking")
-    print("• Advanced velocity warnings and edge case handling")
-    print("• Riser reduction schedule for diameter stepping")
-    print("• Integrated chiller sizing with tons conversion")
-    print("="*80)
+    """Display welcome message and V2 features."""
+    print("="*70)
+    print("🏢 DATA CENTER PIPE SIZER V2")
+    print("="*70)
+    print("Professional chilled-water piping and chiller sizing tool")
+    print("\nV2 Features:")
+    print("• Layout-based sizing (C×R×F format)")
+    print("• Per-hall MW loads with fan heat factor")
+    print("• Shared riser analysis by column")
+    print("• Enhanced velocity warnings and ΔP normalization")
+    print("• Integrated chiller sizing with tons")
+    print("="*70)
 
 
 def get_menu_choice() -> int:
     """Get main menu selection from user."""
-    print("\n🔧 ENHANCED CALCULATION OPTIONS:")
+    print("\n🔧 CALCULATION OPTIONS:")
     print("1. Quick Sizing (Simple MW + ΔT)")
-    print("2. Enhanced Layout Analysis (Advanced with Per-Floor Reduction)")
-    print("3. Enhanced V2 Web Interface Help")
+    print("2. Layout-Based Analysis (Advanced)")
+    print("3. V2 Web Interface Help")
     print("4. Exit")
     
     while True:
@@ -235,9 +225,9 @@ def get_basic_inputs() -> Dict:
     }
 
 
-def get_enhanced_layout_inputs() -> Dict:
-    """Get enhanced layout-based inputs for advanced mode."""
-    print("\n🏗️ ENHANCED LAYOUT CONFIGURATION:")
+def get_layout_inputs() -> Dict:
+    """Get layout-based inputs for advanced mode."""
+    print("\n🏗️ LAYOUT CONFIGURATION:")
     
     # Get layout specification
     while True:
@@ -245,13 +235,7 @@ def get_enhanced_layout_inputs() -> Dict:
         try:
             columns, rows, floors = parse_layout(layout_str)
             total_halls = columns * rows * floors
-            
-            # Calculate riser counts
-            shared_risers_count = calculate_riser_count(columns, rows, True)
-            unshared_risers_count = calculate_riser_count(columns, rows, False)
-            
             print(f"✅ Layout: {columns} columns × {rows} rows × {floors} floors = {total_halls} halls")
-            print(f"   Risers: {shared_risers_count} shared, {unshared_risers_count} unshared")
             break
         except ValueError as e:
             print(f"❌ {e}")
@@ -291,7 +275,7 @@ def get_enhanced_layout_inputs() -> Dict:
                 except ValueError:
                     print("Please enter a valid number.")
     
-    # Enhanced load inputs
+    # Fan heat factor
     while True:
         try:
             fan_heat_pct = float(input("Fan heat percentage (0-20%) [default 5]: ") or 5)
@@ -301,61 +285,27 @@ def get_enhanced_layout_inputs() -> Dict:
         except ValueError:
             print("Please enter a valid number.")
     
-    while True:
-        try:
-            misc_load_mw = float(input("Miscellaneous load (MW) [default 0]: ") or 0)
-            if misc_load_mw >= 0:
-                break
-            print("Misc load must be non-negative.")
-        except ValueError:
-            print("Please enter a valid number.")
-    
-    if misc_load_mw > 0:
-        misc_per_hall = input("Apply misc load per-hall? [Y/n]: ").lower() not in ['n', 'no']
-    else:
-        misc_per_hall = True
-    
     # Basic sizing parameters
     basic_params = get_basic_inputs()
     
     # Riser configuration
     shared_risers = input("\n🏗️ Use shared risers among halls? [Y/n]: ").lower() not in ['n', 'no']
     
-    # Build comprehensive hall table
-    hall_table = build_hall_table(
-        columns=columns,
-        rows=rows,
-        floors=floors,
-        it_mw_data=hall_loads,
-        fan_percent=fan_heat_pct,
-        misc_load_mw=misc_load_mw,
-        misc_per_hall=misc_per_hall,
-        include_floors=include_floors
-    )
-    
-    total_it_mw = hall_table['IT_MW'].sum()
-    total_cooling_mw = hall_table['Total_Cooling_MW'].sum()
-    
     return {
         **basic_params,
         'layout': (columns, rows, floors),
         'include_floors': include_floors,
         'hall_loads': hall_loads,
-        'hall_table': hall_table,
         'fan_heat_pct': fan_heat_pct,
-        'misc_load_mw': misc_load_mw,
-        'misc_per_hall': misc_per_hall,
         'shared_risers': shared_risers,
-        'shared_risers_count': shared_risers_count,
-        'unshared_risers_count': unshared_risers_count,
-        'total_it_mw': total_it_mw,
-        'total_cooling_mw': total_cooling_mw
+        'total_it_mw': sum(hall_loads.values()),
+        'total_cooling_mw': sum(hall_loads.values()) * (1 + fan_heat_pct/100)
     }
 
 
 def run_quick_sizing():
-    """Run quick sizing mode with enhanced features."""
-    print("\n🚀 QUICK SIZING MODE (Enhanced)")
+    """Run quick sizing mode."""
+    print("\n🚀 QUICK SIZING MODE")
     
     # Get inputs
     inputs = get_basic_inputs()
@@ -376,9 +326,9 @@ def run_quick_sizing():
     )
     
     # Display results
-    print("\n" + "="*60)
-    print("📊 ENHANCED QUICK SIZING RESULTS")
-    print("="*60)
+    print("\n" + "="*50)
+    print("📊 QUICK SIZING RESULTS")
+    print("="*50)
     print(f"Total Load: {inputs['mw']} MW")
     print(f"Total Flow: {total_gpm:,.0f} GPM")
     print(f"ΔT: {inputs['delta_t']}°F")
@@ -387,55 +337,39 @@ def run_quick_sizing():
     print("\n🔧 Main Distribution Pipe:")
     for key, value in result.items():
         if "Pressure Drop" in key:
-            print(f"ΔP/100ft (psi): {value}")
+            print(f"{key.replace('Pressure Drop', 'ΔP/100ft')}: {value}")
         else:
             print(f"{key}: {value}")
     
-    # Enhanced velocity and system warnings
+    # Check for warnings
     velocity = result.get('Velocity (ft/s)', 0)
-    warnings = []
-    
     if velocity > 10:
-        warnings.append(f"⚠️ Velocity {velocity} ft/s exceeds 10 ft/s - consider larger diameter")
-    elif velocity < 3:
-        warnings.append(f"ℹ️ Velocity {velocity} ft/s is low - may affect heat transfer")
-    
-    if total_gpm > 50000:
-        warnings.append(f"⚠️ Very large flow rate {total_gpm:,.0f} GPM - verify system capabilities")
-    elif total_gpm < 100:
-        warnings.append(f"ℹ️ Small flow rate {total_gpm:.0f} GPM - consider minimum requirements")
-    
-    if warnings:
-        print("\n⚠️ SYSTEM ANALYSIS:")
-        for warning in warnings:
-            print(f"   {warning}")
+        print(f"\n⚠️  WARNING: Velocity {velocity} ft/s exceeds 10 ft/s")
+        print("   Consider larger pipe to reduce noise and erosion risk.")
     
     # Simple chiller sizing
-    print("\n❄️ CHILLER RECOMMENDATIONS:")
+    print("\n❄️  CHILLER RECOMMENDATIONS:")
     run_chiller_analysis(inputs['mw'])
 
 
-def run_enhanced_layout_analysis():
-    """Run enhanced layout-based analysis with per-floor reduction."""
-    print("\n🏗️ ENHANCED LAYOUT ANALYSIS MODE")
+def run_layout_analysis():
+    """Run advanced layout-based analysis."""
+    print("\n🏗️ LAYOUT-BASED ANALYSIS MODE")
     
     # Get inputs
-    inputs = get_enhanced_layout_inputs()
+    inputs = get_layout_inputs()
     fluid_type, density, viscosity = get_fluid_selection()
     
     columns, rows, floors = inputs['layout']
-    hall_table = inputs['hall_table']
+    hall_loads = inputs['hall_loads']
     
-    print("\n" + "="*70)
-    print("📊 ENHANCED LAYOUT ANALYSIS RESULTS")
-    print("="*70)
-    print(f"Layout: {columns}×{rows}×{floors} ({len(hall_table)} halls)")
+    print("\n" + "="*60)
+    print("📊 LAYOUT ANALYSIS RESULTS")
+    print("="*60)
+    print(f"Layout: {columns}×{rows}×{floors} ({len(hall_loads)} halls)")
     print(f"Total IT Load: {inputs['total_it_mw']:.1f} MW")
-    print(f"Fan Load: {inputs['total_it_mw'] * inputs['fan_heat_pct'] / 100:.1f} MW ({inputs['fan_heat_pct']}%)")
-    print(f"Misc Load: {inputs['misc_load_mw']:.1f} MW ({'per-hall' if inputs['misc_per_hall'] else 'building total'})")
-    print(f"Total Cooling Load: {inputs['total_cooling_mw']:.1f} MW")
+    print(f"Total Cooling Load: {inputs['total_cooling_mw']:.1f} MW (includes {inputs['fan_heat_pct']}% fan heat)")
     print(f"Total Flow: {mw_to_gpm(inputs['total_cooling_mw'], inputs['delta_t']):,.0f} GPM")
-    print(f"Riser Count: {inputs['shared_risers_count'] if inputs['shared_risers'] else inputs['unshared_risers_count']} ({'shared' if inputs['shared_risers'] else 'unshared'})")
     
     # Main distribution sizing
     total_gpm = mw_to_gpm(inputs['total_cooling_mw'], inputs['delta_t'])
@@ -453,28 +387,35 @@ def run_enhanced_layout_analysis():
     print("\n🔧 Main Distribution Pipe:")
     for key, value in main_result.items():
         if "Pressure Drop" in key:
-            print(f"ΔP/100ft (psi): {value}")
+            print(f"{key.replace('Pressure Drop', 'ΔP/100ft')}: {value}")
         else:
             print(f"{key}: {value}")
     
-    # Enhanced riser analysis with per-floor reduction
+    # Riser analysis
     if inputs['shared_risers']:
-        print("\n🏗️ SHARED RISER ANALYSIS (Enhanced with Per-Floor Reduction):")
+        print("\n🏗️ SHARED RISER ANALYSIS (By Column):")
         
-        # Get column summary
-        column_summary = get_column_summary(hall_table)
+        # Create DataFrame for column aggregation
+        import pandas as pd
+        hall_df = pd.DataFrame([
+            {'Hall': hall, 'IT Load (MW)': it_mw} 
+            for hall, it_mw in hall_loads.items()
+        ])
         
-        if not column_summary.empty:
-            print(f"\n{'Column':<8} {'IT MW':<8} {'Fan MW':<8} {'Misc MW':<9} {'Total MW':<10} {'GPM':<8} {'Pipe Size':<12} {'Velocity':<10} {'ΔP/100ft'}")
-            print("-" * 90)
+        col_agg = column_aggregates(hall_df, columns, rows, floors, inputs['include_floors'])
+        
+        if not col_agg.empty:
+            print(f"{'Column':<8} {'IT MW':<8} {'Cooling MW':<12} {'GPM':<8} {'Pipe Size':<12} {'Velocity':<10} {'ΔP/100ft'}")
+            print("-" * 70)
             
             warnings = []
-            for _, row in column_summary.iterrows():
-                col_total_mw = row['Total_Cooling_MW']
-                col_gpm = mw_to_gpm(col_total_mw, inputs['delta_t'])
+            for _, row in col_agg.iterrows():
+                col_it_mw = row['Total_MW']
+                col_cooling_mw = col_it_mw * (1 + inputs['fan_heat_pct']/100)
+                col_gpm = mw_to_gpm(col_cooling_mw, inputs['delta_t'])
                 
-                # Size riser for this column (at base/highest load)
-                col_btu_hr = col_total_mw * 3.412e6
+                # Size riser for this column
+                col_btu_hr = col_cooling_mw * 3.412e6
                 col_mass_flow = col_btu_hr / (inputs['delta_t'] * 1.0)
                 
                 col_result = pipeline_sizing(
@@ -489,58 +430,27 @@ def run_enhanced_layout_analysis():
                 velocity = col_result.get('Velocity (ft/s)', 0)
                 dp_psi = col_result.get('Pressure Drop (psi)', 0)
                 
-                print(f"{row['Column']:<8} {row['Total_IT_MW']:<8.1f} {row['Total_Fan_MW']:<8.1f} {row['Total_Misc_MW']:<9.1f} {col_total_mw:<10.1f} {col_gpm:<8.0f} {pipe_size:<12} {velocity:<10.1f} {dp_psi}")
+                print(f"{row['Column']:<8} {col_it_mw:<8.1f} {col_cooling_mw:<12.1f} {col_gpm:<8.0f} {pipe_size:<12} {velocity:<10.1f} {dp_psi}")
                 
                 if velocity > 10:
                     warnings.append(f"Column {row['Column']}: velocity {velocity:.1f} ft/s > 10 ft/s")
-                elif velocity < 3:
-                    warnings.append(f"Column {row['Column']}: velocity {velocity:.1f} ft/s is low")
-            
-            # Show per-floor reduction schedule
-            if floors > 1:
-                print("\n📋 RISER REDUCTION SCHEDULE (Per Floor):")
-                reduction_schedule = calculate_riser_reduction_schedule(hall_table, columns, rows, floors)
-                
-                if not reduction_schedule.empty:
-                    print(f"{'Column':<8} {'Floor':<6} {'Floor Load':<12} {'Cumulative':<12} {'Remaining':<12}")
-                    print(f"{'      ':<8} {'     ':<6} {'(MW)':<12} {'(MW)':<12} {'(MW)':<12}")
-                    print("-" * 60)
-                    
-                    for _, sched_row in reduction_schedule.iterrows():
-                        print(f"{sched_row['Column']:<8} {sched_row['Floor']:<6} {sched_row['Floor_Load_MW']:<12.1f} "
-                              f"{sched_row['Cumulative_Load_MW']:<12.1f} {sched_row['Remaining_Load_MW']:<12.1f}")
-                    
-                    print("\nℹ️  Remaining Load = Load still carried by riser at this floor level")
-                    print("   Use this for riser diameter stepping calculations")
             
             if warnings:
-                print("\n⚠️ VELOCITY WARNINGS:")
+                print("\n⚠️  VELOCITY WARNINGS:")
                 for warning in warnings:
                     print(f"   {warning}")
     
     else:
-        print(f"\n🏠 INDIVIDUAL HALL ANALYSIS (Unshared Risers):")
-        print(f"Large layout with {len(hall_table)} halls - use Web Interface for detailed per-hall analysis")
-        print(f"Summary: {inputs['unshared_risers_count']} individual riser connections required")
+        print("\n🏠 INDIVIDUAL HALL ANALYSIS:")
+        print("(Per-hall sizing not implemented in CLI - use Web Interface for full analysis)")
     
-    # Enhanced chiller sizing
-    print("\n❄️ ENHANCED CHILLER RECOMMENDATIONS:")
+    # Chiller sizing
+    print("\n❄️  CHILLER RECOMMENDATIONS:")
     run_chiller_analysis(inputs['total_cooling_mw'])
-    
-    # System summary
-    print("\n📋 SYSTEM SUMMARY:")
-    print(f"• Total Halls: {len(hall_table)}")
-    print(f"• Riser Strategy: {'Shared by column' if inputs['shared_risers'] else 'Individual per hall'}")
-    print(f"• Total Risers: {inputs['shared_risers_count'] if inputs['shared_risers'] else inputs['unshared_risers_count']}")
-    print(f"• Main Distribution: {mw_to_gpm(inputs['total_cooling_mw'], inputs['delta_t']):,.0f} GPM")
-    if inputs['misc_load_mw'] > 0:
-        print(f"• Miscellaneous Loads: {inputs['misc_load_mw']:.1f} MW ({'per-hall' if inputs['misc_per_hall'] else 'building'})")
-    
-    print("\nℹ️  For interactive charts and detailed analysis, use: python gradio_app.py")
 
 
 def run_chiller_analysis(cooling_mw: float):
-    """Run enhanced chiller analysis and display results."""
+    """Run chiller analysis and display results."""
     try:
         chiller_results = advanced_chiller_sizing(
             total_mw=cooling_mw,
@@ -568,7 +478,6 @@ def run_chiller_analysis(cooling_mw: float):
             best = chiller_results[0]
             print(f"\n🎯 RECOMMENDATION: {best['total_chillers']} × {best['chiller_size_mw']:.1f} MW chillers")
             print(f"   ({best['operating_chillers']} operating + {best['redundant_chillers']} spare)")
-            print(f"   Equivalent: {best['chiller_size_mw']/0.003517:.0f} tons per chiller")
         else:
             print("❌ No suitable chiller configurations found.")
     
@@ -576,89 +485,60 @@ def run_chiller_analysis(cooling_mw: float):
         print(f"❌ Chiller analysis error: {e}")
 
 
-def show_enhanced_web_interface_help():
-    """Show information about the enhanced V2 web interface."""
-    print("\n🌐 ENHANCED V2 WEB INTERFACE")
-    print("="*60)
-    print("For advanced features and interactive analysis, use the enhanced web interface:")
+def show_web_interface_help():
+    """Show information about the V2 web interface."""
+    print("\n🌐 V2 WEB INTERFACE")
+    print("="*50)
+    print("For advanced features and interactive charts, use the V2 web interface:")
     print()
-    print("🚀 START ENHANCED WEB INTERFACE:")
+    print("🚀 START WEB INTERFACE:")
     print("   python gradio_app.py")
     print()
-    print("🔥 NEW ENHANCED FEATURES:")
-    print("   • Riser count calculations: 2×(C+R) shared, 4×(C+R) unshared")
-    print("   • Per-floor reduction schedules with load stepping")
-    print("   • Enhanced cooling load math (IT + Fan% + Misc)")
-    print("   • Comprehensive hall load tables")
-    print("   • Miscellaneous loads (per-hall or building total)")
-    print("   • Advanced velocity warnings and edge case handling")
+    print("📊 WEB-ONLY FEATURES:")
+    print("   • Interactive Plotly charts")
+    print("   • Layout heatmaps with riser placement")
+    print("   • Editable per-hall MW DataFrames")
+    print("   • Riser stack bar charts")
+    print("   • Export results and charts")
     print()
-    print("📊 INTERACTIVE FEATURES:")
-    print("   • Interactive Plotly charts (velocity, ΔP, layout heatmap)")
-    print("   • Riser stack bar charts with load analysis")
-    print("   • Conditional per-hall MW DataFrames")
-    print("   • Real-time riser reduction schedule display")
-    print("   • Enhanced chiller sizing with tons conversion")
+    print("☁️  CLOUD DEPLOYMENT:")
+    print("   • Ready for Render.com deployment")
+    print("   • Automatic port binding ($PORT)")
+    print("   • Professional UI with responsive design")
     print()
-    print("📋 COMPREHENSIVE OUTPUTS:")
-    print("   • Main plant pipe sizing")
-    print("   • Hall load summary (IT/Fan/Misc breakdown)")
-    print("   • Riser analysis by column")
-    print("   • Per-floor reduction schedule")
-    print("   • Top-3 chiller configurations")
-    print("   • 4 interactive Plotly charts")
-    print()
-    print("☁️ CLOUD DEPLOYMENT READY:")
-    print("   • Enhanced Render.com compatibility")
-    print("   • Matplotlib Agg backend for headless operation")
-    print("   • Robust error handling and edge case management")
-    print("   • Professional responsive UI")
-    print()
-    print("📖 See README.md for complete deployment instructions and examples.")
+    print("📖 See README.md for complete deployment instructions.")
 
 
-def main_enhanced_calculator():
-    """Enhanced main calculator flow control."""
+def main_calculator():
+    """Main calculator flow control."""
     display_welcome()
     
     while True:
         choice = get_menu_choice()
         
-        try:
-            if choice == 1:
-                run_quick_sizing()
-            elif choice == 2:
-                run_enhanced_layout_analysis()
-            elif choice == 3:
-                show_enhanced_web_interface_help()
-            elif choice == 4:
-                print("\n👋 Thank you for using Data Center Pipe Sizer V2 Enhanced!")
-                sys.exit(0)
-        except Exception as e:
-            print(f"\n❌ Error during calculation: {e}")
-            print("Please check your inputs and try again.")
-            continue
+        if choice == 1:
+            run_quick_sizing()
+        elif choice == 2:
+            run_layout_analysis()
+        elif choice == 3:
+            show_web_interface_help()
+        elif choice == 4:
+            print("\n👋 Thank you for using Data Center Pipe Sizer V2!")
+            sys.exit(0)
         
         # Ask if user wants to continue
-        try:
-            continue_choice = input("\nRun another calculation? [Y/n]: ").lower()
-            if continue_choice in ['n', 'no']:
-                print("\n👋 Thank you for using Data Center Pipe Sizer V2 Enhanced!")
-                break
-        except KeyboardInterrupt:
-            print("\n\n👋 Thank you for using Data Center Pipe Sizer V2 Enhanced!")
+        if input("\nRun another calculation? [Y/n]: ").lower() in ['n', 'no']:
+            print("\n👋 Thank you for using Data Center Pipe Sizer V2!")
             break
 
 
 if __name__ == "__main__":
     try:
-        main_enhanced_calculator()
+        main_calculator()
     except KeyboardInterrupt:
         print("\n\n🛑 Operation cancelled by user.")
-        print("👋 Thank you for using Data Center Pipe Sizer V2 Enhanced!")
         sys.exit(0)
     except Exception as e:
-        print(f"\n💥 Unexpected error in enhanced calculator: {e}")
+        print(f"\n💥 Unexpected error: {e}")
         print("Please report this issue with your input parameters.")
-        print("For stable operation, try the web interface: python gradio_app.py")
         sys.exit(1)

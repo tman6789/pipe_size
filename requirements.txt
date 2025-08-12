@@ -1,7 +1,6 @@
 numpy
 pandas
 matplotlib
-streamlit
 plotly
 gradio
 typing_extensions

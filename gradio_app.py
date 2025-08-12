@@ -22,6 +22,10 @@ import gradio as gr
 import os
 from typing import Optional, Dict, List, Tuple
 
+# Set matplotlib backend for headless environments
+import matplotlib
+matplotlib.use('Agg')
+
 # Import existing logic
 from main import pipeline_sizing
 from chiller_sizing import advanced_chiller_sizing, ChillerStrategy, RedundancyModel
@@ -37,7 +41,11 @@ from calc.layout import (
     column_aggregates, 
     create_hall_dataframe, 
     validate_hall_data,
-    get_layout_stats
+    get_layout_stats,
+    calculate_riser_count,
+    build_hall_table,
+    calculate_riser_reduction_schedule,
+    get_column_summary
 )
 from calc.visualization import (
     velocity_figure,
@@ -54,6 +62,8 @@ def compute_v2_results(
     single_total_mw: float,
     hall_data: pd.DataFrame,
     fan_heat_pct: float,
+    misc_load_mw: float,
+    misc_per_hall: bool,
     # Riser inputs  
     shared_risers: bool,
     riser_placement: str,
@@ -80,35 +90,54 @@ def compute_v2_results(
     
     warnings = []
     
-    # Parse layout if provided
-    total_mw = single_total_mw
-    hall_loads_dict = {}
+    # Parse layout and build comprehensive hall table
+    hall_table = pd.DataFrame()
     layout_stats = {}
+    total_it_mw = 0
+    total_cooling_mw = 0
     
     if layout_str and layout_str.strip():
         try:
             columns, rows, floors = parse_layout(layout_str)
             layout_stats = get_layout_stats(layout_str, include_floors)
             
+            # Build IT MW data dictionary
+            it_mw_data = {}
             if use_same_mw:
-                # Use single MW for all halls 
+                # Use single MW for all halls
                 hall_names = make_hall_names(columns, rows, floors, include_floors)
-                halls_per_hall = single_total_mw / len(hall_names) if hall_names else 0
-                hall_loads_dict = {name: halls_per_hall for name in hall_names}
-                total_mw = single_total_mw
+                it_per_hall = single_total_mw / len(hall_names) if hall_names else 0
+                it_mw_data = {name: it_per_hall for name in hall_names}
+                total_it_mw = single_total_mw
             else:
                 # Use per-hall MW from DataFrame
                 if not hall_data.empty and 'Hall' in hall_data.columns and 'IT Load (MW)' in hall_data.columns:
-                    hall_loads_dict = dict(zip(hall_data['Hall'], hall_data['IT Load (MW)']))
-                    total_mw = hall_data['IT Load (MW)'].sum()
+                    it_mw_data = dict(zip(hall_data['Hall'], hall_data['IT Load (MW)']))
+                    total_it_mw = hall_data['IT Load (MW)'].sum()
+            
+            # Build comprehensive hall table with all load calculations
+            hall_table = build_hall_table(
+                columns=columns,
+                rows=rows, 
+                floors=floors,
+                it_mw_data=it_mw_data,
+                fan_percent=fan_heat_pct,
+                misc_load_mw=misc_load_mw,
+                misc_per_hall=misc_per_hall,
+                include_floors=include_floors
+            )
+            
+            total_cooling_mw = hall_table['Total_Cooling_MW'].sum()
+            
         except ValueError as e:
             warnings.append(f"Layout parsing error: {e}")
-    
-    # Apply fan heat factor to get cooling MW
-    cooling_mw = total_mw * (1 + fan_heat_pct / 100)
+    else:
+        # No layout - use simple mode
+        total_it_mw = single_total_mw
+        total_cooling_mw = total_it_mw * (1 + fan_heat_pct / 100) + misc_load_mw
     
     # MW → BTU/hr → lb/hr (Cp≈1.0 BTU/lb°F)
-    btu_hr = cooling_mw * 3.412e6
+    btu_hr = total_cooling_mw * 3.412e6
     mass_flow_rate = btu_hr / (delta_t_f * 1.0)
     
     # Main pipe sizing
@@ -125,38 +154,60 @@ def compute_v2_results(
         main_result["ΔP (psi/100ft)"] = main_result["Pressure Drop (psi)"]
         del main_result["Pressure Drop (psi)"]
     
-    # Check for high velocity warnings
+    # Check for velocity warnings and edge cases
     if "Velocity (ft/s)" in main_result:
-        if main_result["Velocity (ft/s)"] > 10:
-            warnings.append("⚠️ Main pipe velocity exceeds 10 ft/s - consider larger diameter")
+        main_velocity = main_result["Velocity (ft/s)"]
+        if main_velocity > 10:
+            warnings.append(f"⚠️ Main pipe velocity {main_velocity:.1f} ft/s exceeds 10 ft/s - consider larger diameter")
+        elif main_velocity < 3:
+            warnings.append(f"ℹ️ Main pipe velocity {main_velocity:.1f} ft/s is low - may affect heat transfer")
+    
+    # Check for max size limits
+    if "Standard Pipe Size" in main_result:
+        pipe_size = main_result["Standard Pipe Size"]
+        if isinstance(pipe_size, str) and '>' in str(pipe_size):
+            warnings.append("⚠️ Main pipe size exceeds standard schedule - custom fabrication required")
+    elif "Pipe Diameter (in)" in main_result:
+        calc_diameter = main_result["Pipe Diameter (in)"]
+        if calc_diameter > 48:
+            warnings.append(f"⚠️ Calculated diameter {calc_diameter:.1f}\" exceeds typical pipe schedule")
+    
+    # Generate total GPM for system checks
+    total_gpm = mw_to_gpm(total_cooling_mw, delta_t_f)
+    
+    # Check total flow rate reasonableness
+    if total_gpm > 50000:  # Very large systems
+        warnings.append(f"⚠️ Very large flow rate {total_gpm:,.0f} GPM - verify pump and system capabilities")
+    elif total_gpm < 100:  # Very small systems  
+        warnings.append(f"ℹ️ Small flow rate {total_gpm:.0f} GPM - consider minimum flow requirements")
     
     main_df = pd.DataFrame([main_result])
     
     # Riser/Hall analysis
     riser_df = pd.DataFrame()
     hall_df = pd.DataFrame()
+    reduction_schedule_df = pd.DataFrame()
+    riser_count = 0
     
-    if layout_str and hall_loads_dict:
+    if not hall_table.empty:
         try:
             columns, rows, floors = parse_layout(layout_str)
             
+            # Calculate riser count
+            riser_count = calculate_riser_count(columns, rows, shared_risers)
+            
             if shared_risers:
-                # Shared risers - aggregate by column
-                hall_data_for_agg = pd.DataFrame([
-                    {"Hall": hall, "IT Load (MW)": it_mw} 
-                    for hall, it_mw in hall_loads_dict.items()
-                ])
+                # Shared risers - analyze by column
+                column_summary = get_column_summary(hall_table)
                 
-                column_agg = column_aggregates(hall_data_for_agg, columns, rows, floors, include_floors)
-                
-                if not column_agg.empty:
+                if not column_summary.empty:
                     riser_results = []
-                    for _, row in column_agg.iterrows():
-                        col_it_mw = row['Total_MW']
-                        col_cooling_mw = col_it_mw * (1 + fan_heat_pct / 100)
+                    
+                    for _, row in column_summary.iterrows():
+                        col_cooling_mw = row['Total_Cooling_MW']
                         col_gpm = mw_to_gpm(col_cooling_mw, delta_t_f)
                         
-                        # Size this column's riser
+                        # Size this column's riser (at base/highest load)
                         col_btu_hr = col_cooling_mw * 3.412e6
                         col_mass_flow = col_btu_hr / (delta_t_f * 1.0)
                         
@@ -178,21 +229,29 @@ def compute_v2_results(
                         
                         riser_results.append({
                             'Column': row['Column'],
-                            'Total_MW': col_it_mw,
-                            'Cooling_MW': col_cooling_mw,
+                            'IT_MW': row['Total_IT_MW'],
+                            'Fan_MW': row['Total_Fan_MW'],
+                            'Misc_MW': row['Total_Misc_MW'],
+                            'Total_Cooling_MW': col_cooling_mw,
                             'GPM': col_gpm,
                             'Nominal': nominal,
                             'Velocity': velocity,
-                            'ΔP/100ft': dp_psi
+                            'ΔP/100ft': dp_psi,
+                            'Hall_Count': row['Hall_Count']
                         })
                     
                     riser_df = pd.DataFrame(riser_results)
+                    
+                    # Calculate per-floor reduction schedule
+                    reduction_schedule_df = calculate_riser_reduction_schedule(hall_table, columns, rows, floors)
+                    
             else:
-                # Individual hall sizing
+                # Individual hall sizing (unshared risers)
                 hall_results = []
-                for hall, it_mw in hall_loads_dict.items():
-                    if it_mw > 0:
-                        hall_cooling_mw = it_mw * (1 + fan_heat_pct / 100)
+                
+                for _, hall_row in hall_table.iterrows():
+                    if hall_row['Total_Cooling_MW'] > 0:
+                        hall_cooling_mw = hall_row['Total_Cooling_MW']
                         hall_gpm = mw_to_gpm(hall_cooling_mw, delta_t_f)
                         
                         hall_btu_hr = hall_cooling_mw * 3.412e6
@@ -211,12 +270,16 @@ def compute_v2_results(
                         dp_psi = hall_result.get('Pressure Drop (psi)', hall_result.get('ΔP (psi/100ft)', 0))
                         
                         if velocity > 10:
-                            warnings.append(f"⚠️ Hall {hall} velocity {velocity:.1f} ft/s exceeds 10 ft/s")
+                            warnings.append(f"⚠️ Hall {hall_row['Hall']} velocity {velocity:.1f} ft/s exceeds 10 ft/s")
                         
                         hall_results.append({
-                            'Hall': hall,
-                            'IT_MW': it_mw,
-                            'Cooling_MW': hall_cooling_mw,
+                            'Hall': hall_row['Hall'],
+                            'Column': hall_row['Column'],
+                            'Floor': hall_row['Floor'],
+                            'IT_MW': hall_row['IT_MW'],
+                            'Fan_MW': hall_row['Fan_MW'],
+                            'Misc_MW': hall_row['Misc_MW'],
+                            'Total_Cooling_MW': hall_cooling_mw,
                             'GPM': hall_gpm,
                             'Nominal': nominal,
                             'Velocity': velocity,
@@ -243,7 +306,7 @@ def compute_v2_results(
     strategy = strategy_map.get(strategy_name, ChillerStrategy.BALANCED)
     
     chiller_results = advanced_chiller_sizing(
-        total_mw=cooling_mw,  # Use cooling MW for chiller sizing
+        total_mw=total_cooling_mw,  # Use total cooling MW for chiller sizing
         redundancy_model=redundancy_model,
         redundancy_percent=redundancy_percent,
         strategy=strategy,
@@ -294,13 +357,14 @@ def compute_v2_results(
         
         chiller_df_pretty = out_df
     
-    # Generate summary
-    total_gpm = mw_to_gpm(cooling_mw, delta_t_f)
+    # Generate summary (total_gpm already calculated above)
     
     summary_parts = [
-        "### V2 Analysis Summary",
-        f"- **IT Load**: {total_mw:.1f} MW",
-        f"- **Cooling Load**: {cooling_mw:.1f} MW (includes {fan_heat_pct}% fan heat)",
+        "### V2 Enhanced Analysis Summary",
+        f"- **IT Load**: {total_it_mw:.1f} MW",
+        f"- **Fan Load**: {total_it_mw * fan_heat_pct / 100:.1f} MW ({fan_heat_pct}%)",
+        f"- **Misc Load**: {misc_load_mw:.1f} MW ({'per-hall' if misc_per_hall else 'building total'})",
+        f"- **Total Cooling Load**: {total_cooling_mw:.1f} MW",
         f"- **Total Flow**: {total_gpm:,.0f} GPM",
         f"- **ΔT**: {delta_t_f}°F", 
         f"- **Target Velocity**: {target_velocity_fps} ft/s",
@@ -310,6 +374,7 @@ def compute_v2_results(
     
     if layout_str:
         summary_parts.append(f"- **Layout**: {layout_str} ({layout_stats.get('total_halls', 0)} halls)")
+        summary_parts.append(f"- **Riser Count**: {riser_count} ({'shared' if shared_risers else 'unshared'})")
         summary_parts.append(f"- **Riser Strategy**: {'Shared by column' if shared_risers else 'Individual halls'}")
     
     if warnings:
@@ -326,9 +391,10 @@ def compute_v2_results(
     layout_fig = None
     riser_fig = None
     
-    if layout_str and hall_loads_dict:
+    if not hall_table.empty:
         try:
             columns, rows, floors = parse_layout(layout_str)
+            hall_loads_dict = dict(zip(hall_table['Hall'], hall_table['Total_Cooling_MW']))
             layout_fig = layout_heatmap(columns, rows, floors, hall_loads_dict, riser_placement, include_floors)
         except:
             pass
@@ -339,7 +405,9 @@ def compute_v2_results(
     return (
         summary_md, 
         main_df, 
+        hall_table if not hall_table.empty else pd.DataFrame(),  # Return full hall table
         riser_df if not riser_df.empty else hall_df, 
+        reduction_schedule_df,
         chiller_df_pretty,
         vel_fig,
         dp_fig, 
@@ -402,6 +470,16 @@ def build_v2_interface(port: int, share: bool = False):
                     label="Fan Heat % (added to cooling load)"
                 )
                 
+                misc_load_mw = gr.Number(
+                    label="Miscellaneous Load (MW)", 
+                    value=0.0
+                )
+                
+                misc_per_hall = gr.Checkbox(
+                    label="Apply misc load per-hall (vs total building)", 
+                    value=True
+                )
+                
                 # Hall-specific MW input (initially hidden)
                 hall_dataframe = gr.Dataframe(
                     headers=["Hall", "IT Load (MW)"],
@@ -459,12 +537,17 @@ def build_v2_interface(port: int, share: bool = False):
             with gr.Column(scale=2):
                 summary = gr.Markdown()
                 
+                gr.Markdown("## 📋 Analysis Results")
+                
                 with gr.Row():
-                    with gr.Column():
-                        main_table = gr.Dataframe(label="Main Distribution Pipe", interactive=False)
-                        riser_table = gr.Dataframe(label="Riser/Hall Analysis", interactive=False)
-                    with gr.Column():
-                        chiller_table = gr.Dataframe(label="Top 3 Chiller Options", interactive=False)
+                    main_table = gr.Dataframe(label="Main Distribution Pipe", interactive=False)
+                    chiller_table = gr.Dataframe(label="Top 3 Chiller Options", interactive=False)
+                
+                with gr.Row():
+                    hall_table = gr.Dataframe(label="Hall Load Summary", interactive=False)
+                    riser_table = gr.Dataframe(label="Riser Analysis by Column", interactive=False)
+                
+                reduction_table = gr.Dataframe(label="Riser Reduction Schedule (Per Floor)", interactive=False)
                 
                 gr.Markdown("## 📊 Interactive Charts")
                 
@@ -473,7 +556,7 @@ def build_v2_interface(port: int, share: bool = False):
                     dp_chart = gr.Plot(label="Pressure Drop vs Diameter")
                 
                 with gr.Row():
-                    layout_chart = gr.Plot(label="Data Center Layout")
+                    layout_chart = gr.Plot(label="Data Center Layout Heatmap")
                     riser_chart = gr.Plot(label="Riser Stack Analysis")
 
         # Event handlers
@@ -510,8 +593,8 @@ def build_v2_interface(port: int, share: bool = False):
 
         def _on_run_v2(
             layout_str, include_floors, use_same_mw, single_total_mw, hall_data,
-            fan_heat_pct, shared_risers, riser_placement, delta_t, velocity, 
-            fluid_name, max_dp, redundancy, redundancy_pct, strategy, max_units, elec_rate
+            fan_heat_pct, misc_load_mw, misc_per_hall, shared_risers, riser_placement, 
+            delta_t, velocity, fluid_name, max_dp, redundancy, redundancy_pct, strategy, max_units, elec_rate
         ):
             # Convert hall_data to DataFrame if it's not already
             if not isinstance(hall_data, pd.DataFrame):
@@ -531,6 +614,8 @@ def build_v2_interface(port: int, share: bool = False):
                 single_total_mw=single_total_mw,
                 hall_data=hall_data,
                 fan_heat_pct=fan_heat_pct,
+                misc_load_mw=misc_load_mw,
+                misc_per_hall=misc_per_hall,
                 shared_risers=shared_risers,
                 riser_placement=riser_placement,
                 delta_t_f=delta_t,
@@ -548,11 +633,11 @@ def build_v2_interface(port: int, share: bool = False):
             fn=_on_run_v2,
             inputs=[
                 layout_input, include_floors, use_same_mw, single_total_mw, hall_dataframe,
-                fan_heat_pct, shared_risers, riser_placement, delta_t, velocity,
-                fluid, max_dp, redundancy, redundancy_pct, strategy, max_units, elec_rate
+                fan_heat_pct, misc_load_mw, misc_per_hall, shared_risers, riser_placement, 
+                delta_t, velocity, fluid, max_dp, redundancy, redundancy_pct, strategy, max_units, elec_rate
             ],
             outputs=[
-                summary, main_table, riser_table, chiller_table,
+                summary, main_table, hall_table, riser_table, reduction_table, chiller_table,
                 velocity_chart, dp_chart, layout_chart, riser_chart
             ],
         )

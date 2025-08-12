@@ -10,7 +10,11 @@ from calc.layout import (
     column_aggregates,
     create_hall_dataframe,
     validate_hall_data,
-    get_layout_stats
+    get_layout_stats,
+    calculate_riser_count,
+    build_hall_table,
+    calculate_riser_reduction_schedule,
+    get_column_summary
 )
 
 
@@ -265,6 +269,108 @@ class TestGetLayoutStats(unittest.TestCase):
         self.assertIsNotNone(stats['error'])
         self.assertEqual(stats['columns'], 0)
         self.assertEqual(stats['total_halls'], 0)
+
+
+class TestEnhancedFeatures(unittest.TestCase):
+    """Test enhanced V2 features."""
+    
+    def test_calculate_riser_count(self):
+        """Test riser count calculations."""
+        # Test shared risers: 2*(C+R)
+        shared_count = calculate_riser_count(4, 3, True)
+        self.assertEqual(shared_count, 2 * (4 + 3))  # 14
+        
+        # Test unshared risers: 4*(C+R)
+        unshared_count = calculate_riser_count(4, 3, False)
+        self.assertEqual(unshared_count, 4 * (4 + 3))  # 28
+        
+        # Edge case: minimal layout
+        minimal_shared = calculate_riser_count(1, 1, True)
+        self.assertEqual(minimal_shared, 4)  # 2*(1+1)
+    
+    def test_build_hall_table(self):
+        """Test comprehensive hall table building."""
+        it_data = {
+            'A1-F1': 2.0,
+            'A1-F2': 2.0, 
+            'B1-F1': 1.5,
+            'B1-F2': 1.5
+        }
+        
+        hall_table = build_hall_table(
+            columns=2, rows=1, floors=2,
+            it_mw_data=it_data,
+            fan_percent=5.0,
+            misc_load_mw=1.0,
+            misc_per_hall=True
+        )
+        
+        # Check structure
+        expected_columns = ['Hall', 'Column', 'Row', 'Floor', 'IT_MW', 'Fan_MW', 'Misc_MW', 'Total_Cooling_MW']
+        self.assertEqual(list(hall_table.columns), expected_columns)
+        self.assertEqual(len(hall_table), 4)
+        
+        # Check calculations
+        for _, row in hall_table.iterrows():
+            expected_fan = row['IT_MW'] * 0.05  # 5%
+            expected_misc = 1.0 / 4  # 1MW divided by 4 halls
+            expected_total = row['IT_MW'] + expected_fan + expected_misc
+            
+            self.assertAlmostEqual(row['Fan_MW'], expected_fan, places=2)
+            self.assertAlmostEqual(row['Misc_MW'], expected_misc, places=2)
+            self.assertAlmostEqual(row['Total_Cooling_MW'], expected_total, places=2)
+    
+    def test_calculate_riser_reduction_schedule(self):
+        """Test per-floor reduction schedule calculation."""
+        # Create test hall table
+        hall_data = [
+            {'Hall': 'A1-F1', 'Column': 'A', 'Floor': 1, 'Total_Cooling_MW': 2.0},
+            {'Hall': 'A1-F2', 'Column': 'A', 'Floor': 2, 'Total_Cooling_MW': 1.5},
+            {'Hall': 'B1-F1', 'Column': 'B', 'Floor': 1, 'Total_Cooling_MW': 1.0},
+            {'Hall': 'B1-F2', 'Column': 'B', 'Floor': 2, 'Total_Cooling_MW': 0.8}
+        ]
+        hall_table = pd.DataFrame(hall_data)
+        
+        reduction_schedule = calculate_riser_reduction_schedule(hall_table, 2, 1, 2)
+        
+        # Should have entries for each column and floor
+        self.assertGreaterEqual(len(reduction_schedule), 4)
+        
+        # Check column structure  
+        expected_cols = ['Column', 'Floor', 'Floor_Load_MW', 'Cumulative_Load_MW', 'Remaining_Load_MW']
+        self.assertEqual(list(reduction_schedule.columns), expected_cols)
+        
+        # Check that remaining load increases as we go down floors (lower floors carry more load)
+        for column in ['A', 'B']:
+            col_data = reduction_schedule[reduction_schedule['Column'] == column].sort_values('Floor')
+            if len(col_data) > 1:
+                # Lower floor (floor 1) should have less remaining load than higher floor (floor 2)
+                # because remaining load = load that still needs to be carried by the riser at that level
+                self.assertLessEqual(col_data.iloc[0]['Remaining_Load_MW'], col_data.iloc[-1]['Remaining_Load_MW'])
+    
+    def test_get_column_summary(self):
+        """Test column summary aggregation."""
+        hall_data = [
+            {'Column': 'A', 'IT_MW': 2.0, 'Fan_MW': 0.1, 'Misc_MW': 0.2, 'Total_Cooling_MW': 2.3, 'Hall': 'A1-F1'},
+            {'Column': 'A', 'IT_MW': 1.5, 'Fan_MW': 0.08, 'Misc_MW': 0.2, 'Total_Cooling_MW': 1.78, 'Hall': 'A1-F2'},
+            {'Column': 'B', 'IT_MW': 1.0, 'Fan_MW': 0.05, 'Misc_MW': 0.2, 'Total_Cooling_MW': 1.25, 'Hall': 'B1-F1'}
+        ]
+        hall_table = pd.DataFrame(hall_data)
+        
+        summary = get_column_summary(hall_table)
+        
+        # Check structure
+        expected_cols = ['Column', 'Total_IT_MW', 'Total_Fan_MW', 'Total_Misc_MW', 'Total_Cooling_MW', 'Hall_Count']
+        self.assertEqual(list(summary.columns), expected_cols)
+        
+        # Check values
+        col_a = summary[summary['Column'] == 'A'].iloc[0]
+        self.assertAlmostEqual(col_a['Total_IT_MW'], 3.5, places=1)  # 2.0 + 1.5
+        self.assertEqual(col_a['Hall_Count'], 2)
+        
+        col_b = summary[summary['Column'] == 'B'].iloc[0]
+        self.assertAlmostEqual(col_b['Total_IT_MW'], 1.0, places=1)
+        self.assertEqual(col_b['Hall_Count'], 1)
 
 
 if __name__ == '__main__':
