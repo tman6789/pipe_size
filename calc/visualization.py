@@ -342,7 +342,8 @@ def riser_stack_bar(riser_data: pd.DataFrame) -> go.Figure:
     Create bar chart for riser stack analysis.
     
     Args:
-        riser_data: DataFrame with columns ['Column', 'Total_MW', 'GPM', 'Nominal', 'Velocity', 'DP_per_100ft']
+        riser_data: DataFrame with columns like ['Column', 'Total_MW', 'GPM', 'Nominal', 'Velocity']
+                   Supports fallback column names for compatibility
     
     Returns:
         Plotly Figure object
@@ -356,12 +357,37 @@ def riser_stack_bar(riser_data: pd.DataFrame) -> go.Figure:
         )
         return fig
     
+    # Handle column name variations for compatibility
+    mw_column = 'Total_MW'
+    if 'Total_MW' not in riser_data.columns:
+        if 'Total_Cooling_MW' in riser_data.columns:
+            mw_column = 'Total_Cooling_MW'
+        elif 'IT_MW' in riser_data.columns:
+            mw_column = 'IT_MW'
+        else:
+            # If no MW column found, return empty chart
+            fig = go.Figure()
+            fig.update_layout(
+                template='plotly_white',
+                title='MW Load column not found in riser data',
+                height=400
+            )
+            return fig
+    
+    # Ensure GPM column exists, calculate if missing
+    if 'GPM' not in riser_data.columns:
+        if mw_column in riser_data.columns:
+            # Calculate GPM from MW (assume 15°F ΔT)
+            from .flow import mw_to_gpm
+            riser_data = riser_data.copy()
+            riser_data['GPM'] = riser_data[mw_column].apply(lambda mw: mw_to_gpm(mw, 15.0))
+    
     fig = go.Figure()
     
     # MW Load bars
     fig.add_trace(go.Bar(
         x=riser_data['Column'],
-        y=riser_data['Total_MW'],
+        y=riser_data[mw_column],
         name='MW Load',
         marker_color='lightblue',
         yaxis='y',
@@ -369,15 +395,16 @@ def riser_stack_bar(riser_data: pd.DataFrame) -> go.Figure:
     ))
     
     # GPM bars (secondary axis)  
-    fig.add_trace(go.Bar(
-        x=riser_data['Column'],
-        y=riser_data['GPM'],
-        name='GPM',
-        marker_color='orange',
-        opacity=0.7,
-        yaxis='y2',
-        hovertemplate='Column %{x}<br>Flow: %{y:.0f} GPM<extra></extra>'
-    ))
+    if 'GPM' in riser_data.columns:
+        fig.add_trace(go.Bar(
+            x=riser_data['Column'],
+            y=riser_data['GPM'],
+            name='GPM',
+            marker_color='orange',
+            opacity=0.7,
+            yaxis='y2',
+            hovertemplate='Column %{x}<br>Flow: %{y:.0f} GPM<extra></extra>'
+        ))
     
     fig.update_layout(
         template='plotly_white',

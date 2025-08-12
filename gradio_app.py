@@ -110,10 +110,13 @@ def compute_v2_results(
                 it_mw_data = {name: it_per_hall for name in hall_names}
                 total_it_mw = single_total_mw
             else:
-                # Use per-hall MW from DataFrame
+                # Use per-hall MW from DataFrame - coerce numeric columns first
                 if not hall_data.empty and 'Hall' in hall_data.columns and 'IT Load (MW)' in hall_data.columns:
-                    it_mw_data = dict(zip(hall_data['Hall'], hall_data['IT Load (MW)']))
-                    total_it_mw = hall_data['IT Load (MW)'].sum()
+                    # Convert string numbers to float (Gradio sends DataFrame as strings)
+                    hall_data_clean = hall_data.copy()
+                    hall_data_clean['IT Load (MW)'] = pd.to_numeric(hall_data_clean['IT Load (MW)'], errors='coerce').fillna(0)
+                    it_mw_data = dict(zip(hall_data_clean['Hall'], hall_data_clean['IT Load (MW)']))
+                    total_it_mw = hall_data_clean['IT Load (MW)'].sum()
             
             # Build comprehensive hall table with all load calculations
             hall_table = build_hall_table(
@@ -172,7 +175,7 @@ def compute_v2_results(
         if calc_diameter > 48:
             warnings.append(f"⚠️ Calculated diameter {calc_diameter:.1f}\" exceeds typical pipe schedule")
     
-    # Generate total GPM for system checks
+    # Generate total GPM for system checks (single calculation used across all outputs)
     total_gpm = mw_to_gpm(total_cooling_mw, delta_t_f)
     
     # Check total flow rate reasonableness
@@ -233,6 +236,7 @@ def compute_v2_results(
                             'Fan_MW': row['Total_Fan_MW'],
                             'Misc_MW': row['Total_Misc_MW'],
                             'Total_Cooling_MW': col_cooling_mw,
+                            'Total_MW': col_cooling_mw,  # Add Total_MW for riser_stack_bar compatibility
                             'GPM': col_gpm,
                             'Nominal': nominal,
                             'Velocity': velocity,
@@ -596,9 +600,19 @@ def build_v2_interface(port: int, share: bool = False):
             fan_heat_pct, misc_load_mw, misc_per_hall, shared_risers, riser_placement, 
             delta_t, velocity, fluid_name, max_dp, redundancy, redundancy_pct, strategy, max_units, elec_rate
         ):
-            # Convert hall_data to DataFrame if it's not already
+            # Convert hall_data to DataFrame if it's not already, with defensive checks
             if not isinstance(hall_data, pd.DataFrame):
-                hall_data = pd.DataFrame(hall_data, columns=['Hall', 'IT Load (MW)'])
+                try:
+                    hall_data = pd.DataFrame(hall_data, columns=['Hall', 'IT Load (MW)'])
+                except:
+                    hall_data = pd.DataFrame(columns=['Hall', 'IT Load (MW)'])
+            
+            # Ensure numeric columns are properly converted (defensive against Gradio string inputs)
+            if not hall_data.empty and 'IT Load (MW)' in hall_data.columns:
+                try:
+                    hall_data['IT Load (MW)'] = pd.to_numeric(hall_data['IT Load (MW)'], errors='coerce').fillna(0)
+                except:
+                    pass  # If conversion fails, proceed with original data
             
             # Resolve fluid index
             fluids = [get_fluid_name(f) for f in get_fluid_options()]
